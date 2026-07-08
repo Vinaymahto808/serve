@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, Form, File, Query, Body
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import sqlite3
-import json
+import json, asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 import drive_uploader
@@ -220,7 +220,9 @@ async def serve_upload(filename: str):
     return JSONResponse({"error": "not found"}, status_code=404)
 
 screen_frame = None
+screen_frame_mime = "image/jpeg"
 screen_stream_active = False
+_adb_refresh_task = None
 
 @app.post("/api/screen/frame")
 async def screen_frame_upload(file: UploadFile = File(...)):
@@ -245,6 +247,43 @@ async def get_screen_frame():
 @app.get("/api/screen/status")
 async def screen_status():
     return {"active": screen_stream_active, "last_frame": screen_frame is not None}
+
+async def _adb_screen_refresher():
+    global screen_frame, screen_frame_mime, screen_stream_active
+    while True:
+        try:
+            r = await asyncio.create_subprocess_exec(
+                "adb", "exec-out", "screencap", "-p",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await asyncio.wait_for(r.communicate(), timeout=10)
+            stdout = bytes(stdout)
+            if len(stdout) > 500:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(stdout))
+                if img.mode == "RGBA":
+                    bg = Image.new("RGB", img.size, (0, 0, 0))
+                    bg.paste(img, mask=img.split()[3])
+                    img = bg
+                buf = io.BytesIO()
+                w, h = img.size
+                if w > 640:
+                    ratio = 640.0 / w
+                    img = img.resize((640, int(h * ratio)), Image.LANCZOS)
+                img.save(buf, "JPEG", quality=50)
+                buf.seek(0)
+                screen_frame = buf.getvalue()
+                screen_frame_mime = "image/jpeg"
+                screen_stream_active = True
+                img.close()
+        except:
+            pass
+        await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def _start_adb_refresher():
+    global _adb_refresh_task
+    _adb_refresh_task = asyncio.create_task(_adb_screen_refresher())
 
 @app.post("/api/remote/tap")
 async def remote_tap(x: float = Form(...), y: float = Form(...)):
@@ -373,16 +412,19 @@ async def get_status():
 async def file_list(data: dict = Body(...)):
     try:
         path = data.get("path", "/sdcard")
-        import subprocess
+        import subprocess, stat
         r = subprocess.run(["adb", "shell", "ls", "-la", path], capture_output=True, text=True, timeout=10)
+        r2 = subprocess.run(["adb", "shell", "ls", "-1a", path], capture_output=True, text=True, timeout=10)
+        names = [n for n in r2.stdout.strip().split("\n") if n not in (".", "..")]
         entries = []
         for line in r.stdout.split("\n"):
             parts = line.split()
             if len(parts) < 6 or parts[0][0] not in ("-","d","l"): continue
-            is_dir = parts[0][0] == "d"
-            name = " ".join(parts[8:]) if len(parts) > 8 else parts[-1]
+            perms = parts[0]
+            is_dir = perms[0] == "d"
             size = parts[4] if not is_dir else "-"
-            entries.append({"name": name, "dir": is_dir, "size": size, "perms": parts[0]})
+            if not names: break
+            entries.append({"name": names.pop(0), "dir": is_dir, "size": size, "perms": perms})
         return {"ok": True, "path": path, "entries": entries, "error": r.stderr}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -397,7 +439,10 @@ async def file_download(path: str = ""):
         subprocess.run(["adb", "pull", path, tmp.name], capture_output=True, timeout=30)
         if os.path.getsize(tmp.name) == 0:
             return JSONResponse({"error": "file empty or not found"}, 404)
-        return FileResponse(tmp.name, filename=os.path.basename(path))
+        with open(tmp.name, "rb") as f:
+            data = f.read()
+        return Response(content=data, media_type="application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="{os.path.basename(path)}"'})
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
     finally:
