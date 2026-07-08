@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetGuardian</string>
+    <string name="vpn_channel_name">Traffic Monitor</string>
+    <string name="vpn_channel_desc">Monitoring network traffic</string>
+    <string name="start_monitoring">Start Monitoring</string>
+    <string name="stop_monitoring">Stop Monitoring</string>
+</resources>
