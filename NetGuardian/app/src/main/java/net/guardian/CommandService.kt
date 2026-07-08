@@ -33,9 +33,9 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.Dispatchers.IO
 import kotlinx.coroutines.sync.Mutex
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.DataOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -476,21 +476,20 @@ class CommandService : Service() {
         if (surveillanceMode) {
             scope.launch { checkMotion(jpeg) }
         }
-        val body = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart("file", "frame.jpg",
-                jpeg.toRequestBody("image/jpeg".toMediaType()))
-            .build()
-
-        val request = Request.Builder()
-            .url("${ServerUploader.serverUrl}/api/camera/frame")
-            .post(body)
-            .build()
-
         try {
-            ServerUploader.sharedClient.newCall(request).execute().use { response ->
-                response.body?.close()
+            val boundary = "Boundary${System.currentTimeMillis()}"
+            val conn = URL("${ServerUploader.serverUrl}/api/camera/frame").openConnection() as HttpURLConnection
+            conn.connectTimeout = 5000; conn.readTimeout = 5000
+            conn.requestMethod = "POST"; conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+            DataOutputStream(conn.outputStream).use { dos ->
+                dos.writeBytes("--$boundary\r\n")
+                dos.writeBytes("Content-Disposition: form-data; name=\"file\"; filename=\"frame.jpg\"\r\n")
+                dos.writeBytes("Content-Type: image/jpeg\r\n\r\n")
+                dos.write(jpeg)
+                dos.writeBytes("\r\n--$boundary--\r\n")
             }
+            conn.responseCode
         } catch (_: Exception) { }
     }
 

