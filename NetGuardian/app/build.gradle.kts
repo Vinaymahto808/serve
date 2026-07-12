@@ -13,6 +13,13 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        buildConfigField("String", "DEFAULT_SERVER_URL", "\"http://10.195.29.180:8000\"")
+        buildConfigField("String", "AUTH_TOKEN", "\"\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {

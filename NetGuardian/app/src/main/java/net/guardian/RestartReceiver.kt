@@ -9,9 +9,7 @@ import android.os.Build
 
 class RestartReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            scheduleWatchdog(context)
-        }
+        scheduleWatchdog(context)
         scheduleServiceStart(context)
     }
 
@@ -21,15 +19,7 @@ class RestartReceiver : BroadcastReceiver() {
         } catch (_: Exception) {
             try {
                 context.startService(Intent(context, CommandService::class.java))
-            } catch (_: Exception) {
-                try {
-                    context.startActivity(
-                        Intent(context, MainActivity::class.java).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                    )
-                } catch (_: Exception) { }
-            }
+            } catch (_: Exception) { }
         }
     }
 

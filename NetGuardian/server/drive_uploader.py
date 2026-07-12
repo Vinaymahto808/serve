@@ -12,9 +12,14 @@ Setup:
 import json
 import os
 from pathlib import Path
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GOOGLE_DRIVE_AVAILABLE = True
+except ImportError:
+    GOOGLE_DRIVE_AVAILABLE = False
 
 SERVICE_ACCOUNT_FILE = Path(__file__).parent / "service_account.json"
 TARGET_FOLDER_ID = "1tpAkKhiyWQu009jj5hF_UNHIaFAy1afs"
@@ -25,7 +30,7 @@ def get_drive_service():
     global _drive_service
     if _drive_service:
         return _drive_service
-    if not SERVICE_ACCOUNT_FILE.exists():
+    if not GOOGLE_DRIVE_AVAILABLE or not SERVICE_ACCOUNT_FILE.exists():
         return None
     creds = service_account.Credentials.from_service_account_file(
         str(SERVICE_ACCOUNT_FILE),
@@ -35,7 +40,7 @@ def get_drive_service():
     return _drive_service
 
 def is_configured():
-    return SERVICE_ACCOUNT_FILE.exists()
+    return GOOGLE_DRIVE_AVAILABLE and SERVICE_ACCOUNT_FILE.exists()
 
 def upload_file(file_path: str, mime_type: str = None) -> dict | None:
     """Upload a file to the target Drive folder. Returns file info dict or None."""

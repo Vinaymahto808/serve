@@ -1,0 +1,11 @@
+opencv-python
+opencv-contrib-python
+pynput
+pyscreenshot
+sounddevice
+scipy
+pefile
+tensorflow
+scikit-learn
+joblib
+seaborn

